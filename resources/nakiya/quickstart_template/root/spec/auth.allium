@@ -1,0 +1,235 @@
+-- Authentication and authorization.
+--
+-- Password-based login with session tokens.
+-- Accounts gain a password hash; sessions track who
+-- is logged in. Authorization uses the existing role
+-- field on Account.
+
+use "./account.allium" as acct
+
+config {
+    min_password_length: Integer = 8
+    max_login_attempts: Integer = 5
+    lockout_duration: Duration = 15.minutes
+    session_duration: Duration = 24.hours
+}
+
+-- Credential storage. Separate from Account so the
+-- account spec stays clean and password_hash never
+-- leaks into surfaces that expose account fields.
+
+entity Credential {
+    -- Fields
+    account: acct/Account
+    password_hash: String               -- bcrypt output
+    failed_attempts: Integer
+    locked_until: Timestamp?
+
+    -- Derived
+    is_locked: locked_until != null
+        and locked_until > now
+}
+
+entity Session {
+    -- Fields
+    account: acct/Account
+    token: String                        -- opaque bearer token
+    status: active | expired | revoked
+    created_at: Timestamp
+    expires_at: Timestamp
+
+    -- Derived
+    is_valid: status = active
+        and expires_at > now
+}
+
+-- Black-box functions. Implementation chooses bcrypt,
+-- argon2, etc. The spec only cares about the contract.
+
+deferred hash(password)
+deferred verify(password, password_hash)
+deferred generate_token()
+
+-- Login surface: available to anyone, no session
+-- required.
+
+surface Login {
+    facing visitor: anonymous
+
+    exposes:
+        acct/system.initialized
+
+    provides:
+        Authenticate(email, password)
+            when acct/system.initialized
+}
+
+rule Authenticate {
+    when: Authenticate(email, password)
+    let credential = Credential where account.email = email
+
+    requires: credential exists
+    requires: not credential.is_locked
+    requires: credential.account.status = active
+    requires: verify(password, credential.password_hash)
+
+    ensures: credential.failed_attempts = 0
+    ensures: Session.created(
+        account: credential.account,
+        token: generate_token(),
+        status: active,
+        created_at: now,
+        expires_at: now + config.session_duration
+    )
+}
+
+rule LoginFailure {
+    when: Authenticate(email, password)
+    let credential = Credential where account.email = email
+
+    requires: credential exists
+    requires: not credential.is_locked
+    requires: credential.account.status = active
+    requires: not verify(password, credential.password_hash)
+
+    let new_count = credential.failed_attempts + 1
+
+    ensures: credential.failed_attempts = new_count
+    ensures:
+        if new_count >= config.max_login_attempts:
+            credential.locked_until =
+                now + config.lockout_duration
+}
+
+rule LockoutExpires {
+    when: credential: Credential.locked_until <= now
+    requires: credential.is_locked
+
+    ensures: credential.locked_until = null
+    ensures: credential.failed_attempts = 0
+}
+
+-- Session lifecycle.
+
+actor AuthenticatedUser {
+    identified_by: acct/Account
+        where Session with account = this
+            and status = active
+            and expires_at > now
+}
+
+surface ActiveSession {
+    facing user: AuthenticatedUser
+
+    exposes:
+        user.name
+        user.email
+        user.role
+
+    provides:
+        Logout()
+}
+
+rule Logout {
+    when: Logout()
+    let session = Session
+        where account = user and status = active
+
+    ensures:
+        for s in session:
+            s.status = revoked
+}
+
+rule SessionExpires {
+    when: session: Session.expires_at <= now
+    requires: session.status = active
+
+    ensures: session.status = expired
+}
+
+-- Password management.
+
+surface ChangePassword {
+    facing user: AuthenticatedUser
+
+    provides:
+        ChangeOwnPassword(current_password, new_password)
+}
+
+rule ChangeOwnPassword {
+    when: ChangeOwnPassword(current_password, new_password)
+    let credential = Credential where account = user
+
+    requires: verify(current_password,
+        credential.password_hash)
+    requires: new_password.length
+        >= config.min_password_length
+
+    ensures: credential.password_hash =
+        hash(new_password)
+    ensures: credential.failed_attempts = 0
+}
+
+-- Admin password reset (no email flow — this is a
+-- POS system with an on-site admin).
+
+surface AdminPasswordReset {
+    facing admin: AuthenticatedUser
+
+    context accounts: acct/Account
+        where status = active
+
+    guarantee: admin.role = admin
+
+    provides:
+        ResetPassword(account, new_password)
+            when account != admin
+}
+
+rule ResetPassword {
+    when: ResetPassword(account, new_password)
+    let credential = Credential where account = account
+
+    requires: new_password.length
+        >= config.min_password_length
+
+    ensures: credential.password_hash =
+        hash(new_password)
+    ensures: credential.failed_attempts = 0
+    ensures: credential.locked_until = null
+    ensures:
+        for s in Session
+            where account = account and status = active:
+            s.status = revoked
+}
+
+-- Credential creation. Password is provided at account
+-- creation time (InitializeSystem and CreateAccount
+-- both accept a password parameter).
+
+rule CreateCredentialOnAccountCreation {
+    when: account: acct/Account.created
+
+    ensures: Credential.created(
+        account: account,
+        password_hash: hash(account.password),
+        failed_attempts: 0,
+        locked_until: null
+    )
+}
+
+-- Authorization. The existing role field on Account
+-- drives permissions. Surfaces declare their own
+-- guarantee clauses (as AccountManagement and
+-- ProjectManagement already do). This section
+-- formalises the role hierarchy for reference.
+--
+-- admin:           full access
+-- manager:         projects, members, balance sheets
+-- accountant:      balance sheets (read/write)
+-- inventory_clerk: inventory (future)
+-- cashier:         sales (future)
+--
+-- Authorization is enforced at the surface level via
+-- guarantee clauses, not in a centralised permission
+-- table. Each surface owns its access rules.

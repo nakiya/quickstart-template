@@ -1,0 +1,122 @@
+-- Account management for a POS system.
+--
+-- System setup creates the single admin account.
+-- The admin can then create cashier, manager,
+-- inventory clerk, and accountant accounts.
+
+entity System {
+    -- Fields
+    initialized: Boolean
+
+    -- Derived
+    can_setup: not initialized
+}
+
+entity Account {
+    -- Fields
+    name: String
+    email: String
+    role: admin | cashier | manager | inventory_clerk
+        | accountant
+    status: active | disabled
+    created_at: Timestamp
+    created_by: Account?                -- null for the admin
+
+    -- Relationships
+    created_accounts: Account with created_by = this
+}
+
+default System system = {
+    initialized: false
+}
+
+-- Setup: one-time admin account creation.
+
+actor SetupAdmin {
+    identified_by: anonymous
+}
+
+surface Setup {
+    facing admin: SetupAdmin
+
+    exposes:
+        system.can_setup
+
+    provides:
+        InitializeSystem(name, email, password)
+            when system.can_setup
+}
+
+rule InitializeSystem {
+    when: InitializeSystem(name, email, password)
+    requires: system.can_setup
+
+    ensures: Account.created(
+        name: name,
+        email: email,
+        role: admin,
+        status: active,
+        created_at: now,
+        created_by: null
+    )
+    ensures: system.initialized = true
+}
+
+-- Account management: admin creates other accounts.
+
+surface AccountManagement {
+    facing admin: Account
+
+    context accounts: Account
+
+    guarantee: admin.role = admin
+
+    exposes:
+        for account in accounts:
+            account.name
+            account.email
+            account.role
+            account.status
+            account.created_at
+
+    provides:
+        CreateAccount(name, email, role, password)
+            when role in {cashier, manager,
+                inventory_clerk, accountant}
+        DisableAccount(account)
+            when account.status = active
+                and account != admin
+        EnableAccount(account)
+            when account.status = disabled
+}
+
+rule CreateAccount {
+    when: CreateAccount(name, email, role, password)
+    requires: role in {cashier, manager,
+        inventory_clerk, accountant}
+
+    ensures: Account.created(
+        name: name,
+        email: email,
+        role: role,
+        status: active,
+        created_at: now,
+        created_by: admin
+    )
+}
+
+rule DisableAccount {
+    when: DisableAccount(account)
+    requires: account.status = active
+    requires: account.role != admin
+    requires: account != admin           -- cannot disable yourself
+
+    ensures: account.status = disabled
+}
+
+rule EnableAccount {
+    when: EnableAccount(account)
+    requires: account.status = disabled
+
+    ensures: account.status = active
+}

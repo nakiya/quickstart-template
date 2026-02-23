@@ -1,0 +1,5 @@
+{:description "Full-stack Clojure/CLJS quickstart with auth, RBAC, and Mycelium workflows"
+ :transform
+ [["src" "src/{{top/file}}"]
+  ["dev-ns" "dev/{{top/file}}"]
+  ["test-ns" "test/{{top/file}}"]]}

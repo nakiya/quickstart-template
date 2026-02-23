@@ -1,0 +1,14 @@
+.cpcache/
+target/
+.clj-kondo/
+.lsp/
+node_modules/
+resources/public/js/
+resources/public/css/
+.shadow-cljs/
+.nrepl-port
+.claude/settings.local.json
+.portal/
+*.db
+test-results/
+playwright-report/
